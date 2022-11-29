@@ -1,0 +1,207 @@
+---
+title: "BoiseDatastepsFinalv2"
+author: "Haasch"
+date: "2022-11-28"
+output: html_document
+---
+
+```{r, message=F, warning=F}
+library( flexdashboard )
+library( shiny )
+library( rsconnect )
+
+# data wrangling 
+
+library( dplyr )
+
+
+# formatting output
+
+library( DT )
+library( pander )
+library( knitr )
+library( stargazer )
+
+
+# maps
+
+library( ggmap )
+library( leaflet )
+library( viridis )
+library( geojsonio )
+library( sp )
+library( sf )
+library( tmap )
+library(tidycensus)
+library( pals )
+
+census_api_key("6388d1ca9edf20886dd9d59bb5e135368e2856c8")
+```
+
+```{r, warning=F, message=F, results='hide'}
+msp.pop1 <-
+get_acs( geography = "tract", variables = "B01003_001",
+         state = "ID", county = "Ada County", geometry = FALSE ) %>% 
+         select( GEOID, estimate ) %>%
+         rename( POP=estimate )
+
+msp.mhhi1 <-
+get_acs( geography = "tract", variables = "B19013_001",
+         state = "ID", county = "Ada County", geometry = FALSE ) %>% 
+         select( GEOID, estimate ) %>%
+         rename( MHHI=estimate )
+
+
+library( tigris )
+library( pander )
+
+boi <- tracts( state = "ID", county = "Ada County", cb=TRUE, year=2015 )
+```
+
+```{r, warning=F, message=F}
+
+boi <- merge( boi, msp.pop1, by.x="GEOID", by.y="GEOID" )
+boi <- merge( boi, msp.mhhi1, by.x="GEOID", by.y="GEOID" )
+
+boi <- as_Spatial(boi)
+
+head( boi@data ) %>% pander()
+```
+
+```{r}
+plot( boi )
+```
+
+```{r, warning=F, message=F}
+library( rgdal )
+
+# project map and remove empty tracts
+boi <- spTransform( boi, CRS("+init=epsg:3395"))
+boi <- boi[ boi$POP != 0 & (! is.na( boi$POP )) , ]
+
+
+# devtools::install_github( "sjewo/cartogram" )
+
+library( cartogram )  # spatial maps w/ tract size bias reduction
+library( maptools )   # spatial object manipulation 
+library( sf )         # 'simple features' flavor of shapefiles
+
+
+# convert census tract polygons to dorling cartogram
+# no idea why k=0.03 works, but it does - default is k=5
+boi$pop.w <- boi$POP / 10000   # standardizes it to max of 1.5
+boi_dorling <- cartogram_dorling( x=boi, weight="pop.w", k=0.03 )
+
+plot( boi_dorling )
+
+```
+```{r, warning=F, message=F}
+library( tmap )       # thematic maps
+
+tm_shape( boi_dorling ) + 
+  tm_polygons( size="POP", col="MHHI", n=7, style="quantile", palette="Spectral" ) 
+```
+
+
+```{r, warning=F, message=F}
+library(stringr)
+URL1 <- "https://github.com/DS4PS/cpp-529-fall-2020/raw/main/LABS/data/rodeo/LTDB-2000.rds"
+e1 <- readRDS( gzcon( url( URL1 ) ) )
+
+URL2 <- "https://github.com/DS4PS/cpp-529-fall-2020/raw/main/LABS/data/rodeo/LTDB-2010.rds"
+e2 <- readRDS( gzcon( url( URL2 ) ) )
+
+URLmd <- "https://github.com/DS4PS/cpp-529-fall-2020/raw/main/LABS/data/rodeo/LTDB-META-DATA.rds"
+md <- readRDS( gzcon( url( URLmd ) ) )
+
+e1 <- select( e1, - year )
+e2 <- select( e2, - year )
+
+e <- merge( e1, e2, by="tractid" )
+e <- merge( e, md, by="tractid" )
+
+e.no <- e
+e.no$tractid <- gsub("fips", "", e.no$tractid)
+
+
+e.no$tractid <- gsub("-", "", e.no$tractid)
+e.st <- e.no %>% filter(str_detect(tractid, "^06"))
+e.st$tractid <- gsub("^0", "", e.st$tractid)
+
+boi_dorling <- merge(boi_dorling, e.st, by.x = "GEOID", by.y = "tractid", all.x = T)
+```
+
+```{r, warning=F, message=F}
+keep.these <- c("pnhwht12", "pnhblk12", "phisp12", "pntv12", "pfb12", "polang12", 
+"phs12", "pcol12", "punemp12", "pflabf12", "pprof12", "pmanuf12", 
+"pvet12", "psemp12", "hinc12", "incpc12", "ppov12", "pown12", 
+"pvac12", "pmulti12", "mrent12", "mhmval12", "p30old12", "p10yrs12", 
+"p18und12", "p60up12", "p75up12", "pmar12", "pwds12", "pfhh12")
+
+library(mclust)
+
+d1 <- boi_dorling@data
+d2 <- select( d1, keep.these )
+d3 <- apply( d2, 2, scale )
+
+set.seed( 1234 )
+fit <- Mclust( d3 )
+boi_dorling$cluster <- fit$classification
+
+head( d3[,1:6] ) %>% pander()
+
+summary( fit )
+
+#class(boi_dorling)
+```
+
+```{r, warning=F, message=F}
+#boise <- boi_dorling
+
+mhv.00 <- boi_dorling$mhmval00 * 1.28855  
+mhv.10 <- boi_dorling$mhmval12
+
+# change in MHV in dollars
+mhv.change <- mhv.10 - mhv.00
+
+# drop low 2000 median home values
+# to avoid unrealistic growth rates.
+#
+# tracts with homes that cost less than
+# $1,000 are outliers
+mhv.00[ mhv.00 < 1000 ] <- NA
+
+# change in MHV in percent
+mhv.growth <- 100 * ( mhv.change / mhv.00 )
+
+#omit rates larger than 200%
+
+mhv.growth[ mhv.growth > 200 ] <- NA
+```
+
+```{r, warning=F, message=F}
+boi_dorling$mhv.00 <- mhv.00
+boi_dorling$mhv.10 <- mhv.10
+boi_dorling$mhv.change <- mhv.change
+boi_dorling$mhv.growth <- mhv.growth 
+
+boise1 <- boi_dorling
+
+class(boi_dorling)
+```
+
+```{r, warning=F, message=F}
+library( geojsonio )
+library(rgdal)
+
+yourDF <- as.data.frame(boi_dorling)
+
+row.names(yourDF) <- sapply(slot(boi_dorling, "polygons"), function(x) slot(x, "ID"))
+
+yourNewPolygon<- SpatialPolygonsDataFrame(boi_dorling, yourDF)
+
+#https://gis.stackexchange.com/questions/141469/how-to-convert-a-spatialpolygon-to-a-spatialpolygonsdataframe-and-add-a-column-t
+
+ yourNewPolygon <- spTransform( yourNewPolygon, CRS("+proj=longlat +datum=WGS84") )
+ geojson_write( yourNewPolygon, file="boi_d_dorling.geojson", geometry="polygon" )
+```
